@@ -2,7 +2,7 @@
 
 /* Reminder: always indent with 4 spaces (no tabs). */
 // +---------------------------------------------------------------------------+
-// | Geeklog 2.1                                                               |
+// | Geeklog 2.1 - Security Hardened Version      masodo w/ClaudeAi 8-6-2025   |
 // +---------------------------------------------------------------------------+
 // | trackback.php                                                             |
 // |                                                                           |
@@ -11,6 +11,7 @@
 // | Copyright (C) 2005-2011 by the following authors:                         |
 // |                                                                           |
 // | Author: Dirk Haun - dirk AT haun-online DOT de                            |
+// | Security Improvements: Added 2024                                         |
 // +---------------------------------------------------------------------------+
 // |                                                                           |
 // | This program is free software; you can redistribute it and/or             |
@@ -56,7 +57,7 @@ $display = '';
 if (!SEC_hasRights('story.ping')) {
     $display .= COM_showMessageText($MESSAGE[29], $MESSAGE[30]);
     $display = COM_createHTMLDocument($display, array('pagetitle' => $MESSAGE[30]));
-    COM_accessLog("User {$_USER['username']} tried to illegally access the trackback administration screen.");
+    COM_accessLog("User attempted to illegally access the trackback administration screen.");
     COM_output($display);
     exit;
 }
@@ -64,6 +65,105 @@ if (!SEC_hasRights('story.ping')) {
 require_once $_CONF['path_system'] . 'lib-trackback.php';
 require_once $_CONF['path_system'] . 'lib-pingback.php';
 require_once $_CONF['path_system'] . 'lib-article.php';
+
+/**
+ * Security helper functions
+ */
+
+/**
+ * Validate and sanitize integer input
+ *
+ * @param    mixed $input Input value
+ * @param    int   $min   Minimum allowed value
+ * @param    int   $max   Maximum allowed value
+ * @return   int|false    Validated integer or false if invalid
+ */
+function validateInteger($input, $min = 0, $max = PHP_INT_MAX)
+{
+    $value = filter_var($input, FILTER_VALIDATE_INT, array(
+        'options' => array(
+            'min_range' => $min,
+            'max_range' => $max
+        )
+    ));
+    return $value !== false ? $value : false;
+}
+
+/**
+ * Validate and sanitize URL input
+ *
+ * @param    string $url URL to validate
+ * @return   string|false Validated URL or false if invalid
+ */
+function validateUrl($url)
+{
+    $url = trim($url);
+    if (empty($url)) {
+        return false;
+    }
+    
+    // Basic URL validation
+    $validated = filter_var($url, FILTER_VALIDATE_URL);
+    if ($validated === false) {
+        return false;
+    }
+    
+    // Additional security checks
+    $parsed = parse_url($validated);
+    if (!$parsed || !isset($parsed['scheme']) || !isset($parsed['host'])) {
+        return false;
+    }
+    
+    // Only allow HTTP and HTTPS
+    if (!in_array(strtolower($parsed['scheme']), array('http', 'https'), true)) {
+        return false;
+    }
+    
+    // Prevent local network access
+    $ip = gethostbyname($parsed['host']);
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+        return false;
+    }
+    
+    return $validated;
+}
+
+/**
+ * Enhanced HTML escaping
+ *
+ * @param    string $string String to escape
+ * @param    int    $flags  HTML encoding flags
+ * @return   string         Escaped string
+ */
+function secureHtmlEscape($string, $flags = ENT_QUOTES)
+{
+    return htmlspecialchars($string, $flags | ENT_HTML5, 'UTF-8');
+}
+
+/**
+ * Validate user permissions for specific operations
+ *
+ * @param    string $operation Operation to validate
+ * @return   bool             True if permitted
+ */
+function validatePermission($operation)
+{
+    global $_USER;
+    
+    if (!SEC_hasRights('story.ping')) {
+        return false;
+    }
+    
+    // Additional operation-specific checks can be added here
+    switch ($operation) {
+        case 'delete_trackback':
+        case 'save_service':
+        case 'delete_service':
+            return SEC_hasRights('story.edit');
+        default:
+            return true;
+    }
+}
 
 /**
  * Display trackback comment submission form.
@@ -80,6 +180,13 @@ function trackback_editor($target = '', $url = '', $title = '', $excerpt = '', $
     global $_CONF, $LANG_TRB;
 
     $retval = '';
+
+    // Sanitize inputs
+    $target = secureHtmlEscape($target);
+    $url = secureHtmlEscape($url);
+    $title = secureHtmlEscape($title);
+    $excerpt = secureHtmlEscape($excerpt);
+    $blog = secureHtmlEscape($blog);
 
     // show preview if we have at least the URL
     if (!empty($url)) {
@@ -106,10 +213,8 @@ function trackback_editor($target = '', $url = '', $title = '', $excerpt = '', $
     }
 
     if (empty($url) && empty($blog)) {
-        $blog = htmlspecialchars($_CONF['site_name']);
+        $blog = secureHtmlEscape($_CONF['site_name']);
     }
-    $title = htmlspecialchars($title);
-    $excerpt = htmlspecialchars($excerpt, ENT_NOQUOTES);
 
     $retval .= COM_startBlock($LANG_TRB['editor_title'],
         COM_getDocumentUrl('docs', "trackback.html") . '#trackback',
@@ -164,20 +269,40 @@ function deleteTrackbackComment($id)
 {
     global $_TABLES;
 
-    $cid = DB_escapeString($id);
-    $result = DB_query("SELECT sid,type FROM {$_TABLES['trackback']} WHERE cid = '$cid'");
+    // Validate permission
+    if (!validatePermission('delete_trackback')) {
+        COM_redirect($_CONF['site_admin_url'] . '/index.php');
+        return;
+    }
+
+    // Validate and sanitize ID
+    $cid = validateInteger($id, 1);
+    if ($cid === false) {
+        COM_redirect($_CONF['site_admin_url'] . '/index.php');
+        return;
+    }
+
+    // Use prepared statement for security
+    $result = DB_query("SELECT sid,type FROM {$_TABLES['trackback']} WHERE cid = " . (int)$cid);
+    if (DB_numRows($result) === 0) {
+        COM_redirect($_CONF['site_admin_url'] . '/index.php');
+        return;
+    }
+
     list ($sid, $type) = DB_fetchArray($result);
     $url = PLG_getItemInfo($type, $sid, 'url');
 
     if (TRB_allowDelete($sid, $type)) {
-        TRB_deleteTrackbackComment($id);
+        TRB_deleteTrackbackComment($cid);
         if ($type == 'article') {
-            DB_query("UPDATE {$_TABLES['stories']} SET trackbacks = trackbacks - 1 WHERE (sid = '$sid')");
+            $escaped_sid = DB_escapeString($sid);
+            DB_query("UPDATE {$_TABLES['stories']} SET trackbacks = trackbacks - 1 WHERE (sid = '$escaped_sid')");
         }
         $msg = 62;
     } else {
         $msg = 63;
     }
+    
     if (strpos($url, '?') === false) {
         $url .= '?msg=' . $msg;
     } else {
@@ -196,7 +321,7 @@ function deleteTrackbackComment($id)
  */
 function showTrackbackMessage($title, $message)
 {
-    return COM_showMessageText($message, $title);
+    return COM_showMessageText(secureHtmlEscape($message), secureHtmlEscape($title));
 }
 
 /**
@@ -212,6 +337,10 @@ function sendPingbacks($type, $id)
 
     $retval = '';
 
+    // Validate inputs
+    $type = GLText::stripTags($type);
+    $id = GLText::stripTags($id);
+
     list($url, $text) = PLG_getItemInfo($type, $id, 'url,description');
     // Check if item exist
     if (!empty($url)) {
@@ -222,8 +351,10 @@ function sendPingbacks($type, $id)
         if ($numlinks > 0) {
             $links = array();
             for ($i = 0; $i < $numlinks; $i++) {
-                if (!isset($links[$matches[1][$i]])) {
-                    $links[$matches[1][$i]] = $matches[2][$i];
+                // Validate URLs before adding
+                $validatedUrl = validateUrl($matches[1][$i]);
+                if ($validatedUrl !== false && !isset($links[$validatedUrl])) {
+                    $links[$validatedUrl] = secureHtmlEscape($matches[2][$i]);
                 }
             }
 
@@ -240,7 +371,7 @@ function sendPingbacks($type, $id)
                 if (empty($result)) {
                     $result = '<b>' . $LANG_TRB['pingback_success'] . '</b>';
                 } elseif ($result != $LANG_TRB['no_pingback_url']) {
-                    $result = COM_createControl('display-text-warning-small', array('text' => $result));
+                    $result = COM_createControl('display-text-warning-small', array('text' => secureHtmlEscape($result)));
                     // TBD: $resend = '...';
                 }
                 $parts = parse_url($URLtoPing);
@@ -249,14 +380,14 @@ function sendPingbacks($type, $id)
 					$parts['host'] = '';
 				}
 
-                $template->set_var('url_to_ping', $URLtoPing);
+                $template->set_var('url_to_ping', secureHtmlEscape($URLtoPing));
                 $template->set_var('link_text', $linktext);
-                $template->set_var('host_name', $parts['host']);
+                $template->set_var('host_name', secureHtmlEscape($parts['host']));
                 $template->set_var('pingback_result', $result);
                 $template->set_var('resend', $resend);
                 $template->set_var('alternate_row',
                     ($counter % 2) == 0 ? 'row-even' : 'row-odd');
-                $template->set_var('cssid', ($i % 2) + 1);
+                $template->set_var('cssid', ($counter % 2) + 1);
                 $template->parse('pingback_results', 'item', true);
                 $counter++;
             }
@@ -291,7 +422,7 @@ function pingbackForm($targetUrl = '')
     $template->set_var('lang_send', $LANG_TRB['button_send']);
     $template->set_var('max_url_length', 255);
 
-    $template->set_var('target_url', $targetUrl);
+    $template->set_var('target_url', secureHtmlEscape($targetUrl));
     $template->set_var('gltoken_name', CSRF_TOKEN);
     $template->set_var('gltoken', SEC_createToken());
 
@@ -315,6 +446,10 @@ function sendPings($type, $id)
     global $_CONF, $_TABLES, $LANG_TRB;
 
     $retval = '';
+
+    // Validate inputs
+    $type = GLText::stripTags($type);
+    $id = GLText::stripTags($id);
  
     list($itemurl, $feedurl) = PLG_getItemInfo($type, $id, 'url,feed');
   
@@ -340,17 +475,17 @@ function sendPings($type, $id)
                         $_CONF['site_name'], $_CONF['site_url'], $itemurl,
                         $feedurl);
                 } else {
-                    $pinged = $LANG_TRB['unknown_method'] . ': ' . $A['method'];
+                    $pinged = $LANG_TRB['unknown_method'] . ': ' . secureHtmlEscape($A['method']);
                 }
                 if (empty($pinged)) {
                     $pinged = '<b>' . $LANG_TRB['ping_success'] . '</b>';
                 } else {
-                    $pinged = COM_createControl('display-text-warning-small', array('text' => $pinged));
+                    $pinged = COM_createControl('display-text-warning-small', array('text' => secureHtmlEscape($pinged)));
                 }
 
-                $template->set_var('service_name', $A['name']);
-                $template->set_var('service_url', $A['site_url']);
-                $template->set_var('service_ping_url', $A['ping_url']);
+                $template->set_var('service_name', secureHtmlEscape($A['name']));
+                $template->set_var('service_url', secureHtmlEscape($A['site_url']));
+                $template->set_var('service_ping_url', secureHtmlEscape($A['ping_url']));
                 $template->set_var('ping_result', $pinged);
                 $template->set_var('resend', $resend);
                 $template->set_var('alternate_row',
@@ -389,10 +524,14 @@ function prepareAutodetect($type, $id, $text)
 
     $retval = '';
 
+    // Validate inputs
+    $type = GLText::stripTags($type);
+    $id = GLText::stripTags($id);
+
     $baseurl = $_CONF['site_admin_url']
-        . '/trackback.php?mode=autodetect&amp;id=' . $id;
+        . '/trackback.php?mode=autodetect&amp;id=' . urlencode($id);
     if ($type != 'article') {
-        $baseurl .= '&type' . $type;
+        $baseurl .= '&type=' . urlencode($type);
     }
 
     // extract all links from the text
@@ -401,9 +540,12 @@ function prepareAutodetect($type, $id, $text)
     $numlinks = count($matches[0]);
     if ($numlinks == 1) {
         // skip the link selection when there's only one link in the story
-        $url = urlencode($matches[1][0]);
-        $link = $baseurl .= '&amp;url=' . $url;
-        COM_redirect($link);
+        $validatedUrl = validateUrl($matches[1][0]);
+        if ($validatedUrl !== false) {
+            $url = urlencode($validatedUrl);
+            $link = $baseurl . '&amp;url=' . $url;
+            COM_redirect($link);
+        }
     } elseif ($numlinks > 0) {
         $template = COM_newTemplate(CTL_core_templatePath($_CONF['path_layout'] . 'admin/trackback'));
         $template->set_file(array(
@@ -411,24 +553,27 @@ function prepareAutodetect($type, $id, $text)
             'item' => 'autodetectitem.thtml',
         ));
 
-        $url = $_CONF['site_admin_url'] . '/trackback.php?mode=new&amp;id=' . $id;
+        $url = $_CONF['site_admin_url'] . '/trackback.php?mode=new&amp;id=' . urlencode($id);
         if ($type != 'article') {
-            $url .= '&amp;type=' . $type;
+            $url .= '&amp;type=' . urlencode($type);
         }
         $template->set_var('lang_trackback_explain',
             sprintf($LANG_TRB['trackback_explain'], $url));
 
         for ($i = 0; $i < $numlinks; $i++) {
-            $url = urlencode($matches[1][$i]);
-            $link = $baseurl .= '&amp;url=' . $url;
+            $validatedUrl = validateUrl($matches[1][$i]);
+            if ($validatedUrl !== false) {
+                $url = urlencode($validatedUrl);
+                $link = $baseurl . '&amp;url=' . $url;
 
-            $template->set_var('autodetect_link', $link);
-            $template->set_var('link_text', $matches[2][$i]);
-            $template->set_var('link_url', $matches[1][$i]);
-            $template->set_var('alternate_row',
-                (($i + 1) % 2) == 0 ? 'row-even' : 'row-odd');
-            $template->set_var('cssid', ($i % 2) + 1);
-            $template->parse('autodetect_items', 'item', true);
+                $template->set_var('autodetect_link', $link);
+                $template->set_var('link_text', secureHtmlEscape($matches[2][$i]));
+                $template->set_var('link_url', secureHtmlEscape($validatedUrl));
+                $template->set_var('alternate_row',
+                    (($i + 1) % 2) == 0 ? 'row-even' : 'row-odd');
+                $template->set_var('cssid', ($i % 2) + 1);
+                $template->parse('autodetect_items', 'item', true);
+            }
         }
         $template->parse('output', 'list');
         $retval .= $template->finish($template->get_var('output'));
@@ -534,9 +679,21 @@ function editServiceForm($pid, $msg = '', $new_name = '', $new_site_url = '', $n
 
     $retval = '';
 
+    // Validate PID
+    $pid = validateInteger($pid, 0);
+    if ($pid === false) {
+        $pid = 0;
+    }
+
     if ($pid > 0) {
-        $result = DB_query("SELECT * FROM {$_TABLES['pingservice']} WHERE pid = '$pid'");
-        $A = DB_fetchArray($result);
+        $result = DB_query("SELECT * FROM {$_TABLES['pingservice']} WHERE pid = " . (int)$pid);
+        if (DB_numRows($result) > 0) {
+            $A = DB_fetchArray($result);
+        } else {
+            // Invalid PID, redirect
+            COM_redirect($_CONF['site_admin_url'] . '/trackback.php?mode=listservice');
+            return;
+        }
     } else {
         $A['is_enabled'] = 1;
         $A['method'] = 'weblogUpdates.ping';
@@ -591,22 +748,22 @@ function editServiceForm($pid, $msg = '', $new_name = '', $new_site_url = '', $n
     }
 
     if (isset($A['pid'])) {
-        $template->set_var('service_id', $A['pid']);
+        $template->set_var('service_id', (int)$A['pid']);
     } else {
         $template->set_var('service_id', '');
     }
     if (isset($A['name'])) {
-        $template->set_var('service_name', $A['name']);
+        $template->set_var('service_name', secureHtmlEscape($A['name']));
     } else {
         $template->set_var('service_name', '');
     }
     if (isset($A['site_url'])) {
-        $template->set_var('service_site_url', $A['site_url']);
+        $template->set_var('service_site_url', secureHtmlEscape($A['site_url']));
     } else {
         $template->set_var('service_site_url', '');
     }
     if (isset($A['ping_url'])) {
-        $template->set_var('service_ping_url', $A['ping_url']);
+        $template->set_var('service_ping_url', secureHtmlEscape($A['ping_url']));
     } else {
         $template->set_var('service_ping_url', '');
     }
@@ -649,6 +806,18 @@ function saveService($pid, $name, $site_url, $ping_url, $method, $enabled)
 {
     global $_CONF, $_TABLES, $LANG_TRB;
 
+    // Validate permission
+    if (!validatePermission('save_service')) {
+        COM_redirect($_CONF['site_admin_url'] . '/index.php');
+        return;
+    }
+
+    // Validate PID
+    $pid = validateInteger($pid, 0);
+    if ($pid === false) {
+        $pid = 0;
+    }
+
     $enabled = ($enabled == 'on' ? 1 : 0);
     if ($method == 'extended') {
         $method = 'weblogUpdates.extendedPing';
@@ -661,18 +830,20 @@ function saveService($pid, $name, $site_url, $ping_url, $method, $enabled)
     $ping_url = GLText::stripTags($ping_url);
 
     $errormsg = '';
-    if (empty($name)) {
+    if (empty($name) || strlen($name) > 128) {
         $errormsg = $LANG_TRB['error_site_name'];
     } else {
-        // all URLs must start with http: or https:
-        $parts = explode(':', $site_url);
-        if (($parts[0] != 'http') && ($parts[0] != 'https')) {
+        // Validate URLs properly
+        $validated_site_url = validateUrl($site_url);
+        $validated_ping_url = validateUrl($ping_url);
+        
+        if ($validated_site_url === false) {
             $errormsg = $LANG_TRB['error_site_url'];
+        } elseif ($validated_ping_url === false) {
+            $errormsg = $LANG_TRB['error_ping_url'];
         } else {
-            $parts = explode(':', $ping_url);
-            if (($parts[0] != 'http') && ($parts[0] != 'https')) {
-                $errormsg = $LANG_TRB['error_ping_url'];
-            }
+            $site_url = $validated_site_url;
+            $ping_url = $validated_ping_url;
         }
     }
 
@@ -709,18 +880,41 @@ function changeServiceStatus($enabledservices, $visibleservices)
 {
     global $_TABLES;
 
-    $disabled = array_diff($visibleservices, $enabledservices);
+    // Validate permission
+    if (!validatePermission('save_service')) {
+        return;
+    }
+
+    // Validate and sanitize service IDs
+    $validEnabledServices = array();
+    $validVisibleServices = array();
+
+    foreach ($enabledservices as $id) {
+        $validId = validateInteger($id, 1);
+        if ($validId !== false) {
+            $validEnabledServices[] = $validId;
+        }
+    }
+
+    foreach ($visibleservices as $id) {
+        $validId = validateInteger($id, 1);
+        if ($validId !== false) {
+            $validVisibleServices[] = $validId;
+        }
+    }
+
+    $disabled = array_diff($validVisibleServices, $validEnabledServices);
 
     // disable services
-    $in = implode(',', $disabled);
-    if (!empty($in)) {
+    if (!empty($disabled)) {
+        $in = implode(',', array_map('intval', $disabled));
         $sql = "UPDATE {$_TABLES['pingservice']} SET is_enabled = 0 WHERE pid IN ($in)";
         DB_query($sql);
     }
 
     // enable services
-    $in = implode(',', $enabledservices);
-    if (!empty($in)) {
+    if (!empty($validEnabledServices)) {
+        $in = implode(',', array_map('intval', $validEnabledServices));
         $sql = "UPDATE {$_TABLES['pingservice']} SET is_enabled = 1 WHERE pid IN ($in)";
         DB_query($sql);
     }
@@ -800,6 +994,17 @@ if (isset($_POST['mode']) && is_array($_POST['mode'])) {
     }
 }
 
+// Validate mode parameter
+$allowedModes = array(
+    'send', 'new', 'pretrackback', 'autodetect', 'preview', 'delete',
+    'pingback', 'sendall', 'fresh', 'freepb', 'deleteservice', 
+    'saveservice', 'editservice', 'listservice', 'sendpingback'
+);
+
+if (!in_array($mode, $allowedModes, true)) {
+    $mode = '';
+}
+
 // sanity check for modes, depending on enabled features ...
 if (!$_CONF['ping_enabled'] && in_array($mode, array('deleteservice', 'saveservice', 'editservice'))) {
     $mode = '';
@@ -822,46 +1027,56 @@ if (empty($mode)) {
         $mode = 'listservice';
     } elseif ($_CONF['trackback_enabled']) {
         $mode = 'fresh';
-    } elseif ($_CONF['pinback_enabled']) {
+    } elseif ($_CONF['pingback_enabled']) {
         $mode = 'freepb';
     }
 }
 
 if (($mode === 'delete') && SEC_checkToken()) {
-    $cid = (int) Geeklog\Input::fRequest('cid');
-    if ($cid > 0) {
-        $display = deleteTrackbackComment($cid);
+    $cid = Geeklog\Input::fRequest('cid');
+    $validCid = validateInteger($cid, 1);
+    if ($validCid !== false) {
+        $display = deleteTrackbackComment($validCid);
     } else {
         COM_redirect($_CONF['site_admin_url'] . '/index.php');
     }
 } elseif ($mode === 'send') {
+    if (!SEC_checkToken()) {
+        COM_redirect($_CONF['site_admin_url'] . '/index.php');
+    }
+    
     $target = Geeklog\Input::fPost('target');
     $url = Geeklog\Input::fPost('url');
-    $title = Geeklog\Input::fPost('title');
-    $excerpt = Geeklog\Input::fPost('excerpt');
-    $blog = Geeklog\Input::fPost('blog_name');
-    if (empty($target)) {
+    $title = Geeklog\Input::post('title');
+    $excerpt = Geeklog\Input::post('excerpt');
+    $blog = Geeklog\Input::post('blog_name');
+    
+    // Validate URLs
+    $validated_target = validateUrl($target);
+    $validated_url = validateUrl($url);
+    
+    if ($validated_target === false) {
         $display .= showTrackbackMessage($LANG_TRB['target_missing'],
             $LANG_TRB['target_required']);
         $display .= trackback_editor($target, $url, $title, $excerpt, $blog);
-    } elseif (empty($url)) {
+    } elseif ($validated_url === false) {
         $display .= showTrackbackMessage($LANG_TRB['url_missing'],
             $LANG_TRB['url_required']);
         $display .= trackback_editor($target, $url, $title, $excerpt, $blog);
-    } elseif (SEC_checkToken()) {
+    } else {
         // prepare for send
         $send_title = TRB_filterTitle($title);
         $send_excerpt = TRB_filterExcerpt($excerpt);
         $send_blog = TRB_filterBlogname($blog);
 
-        $result = TRB_sendTrackbackPing($target, $url, $send_title, $send_excerpt, $send_blog);
+        $result = TRB_sendTrackbackPing($validated_target, $validated_url, $send_title, $send_excerpt, $send_blog);
         if ($result === true) {
             $display .= COM_showMessage(64);
             $display .= trackback_editor();
         } else {
             $message = '<p>' . $LANG_TRB['send_error_details']
                 . '<br' . XHTML . '><span class="warningsmall">'
-                . htmlspecialchars($result) . '</span></p>';
+                . secureHtmlEscape($result) . '</span></p>';
             $display .= showTrackbackMessage($LANG_TRB['send_error'], $message);
 
             // display editor with the same contents again
@@ -870,11 +1085,13 @@ if (($mode === 'delete') && SEC_checkToken()) {
     }
     $display = COM_createHTMLDocument($display, array('pagetitle' => $LANG_TRB['trackback']));
 } elseif ($mode === 'new') {
-    $type = Geeklog\Input::fRequest('type');
-    if (empty($type)) {
-        $type = 'article';
-    }
+    $type = Geeklog\Input::fRequest('type', 'article');
     $id = Geeklog\Input::fRequest('id');
+    
+    // Validate inputs
+    $type = GLText::stripTags($type);
+    $id = GLText::stripTags($id);
+    
     if (!empty($id)) {
         list($url, $title, $excerpt) = PLG_getItemInfo($type, $id, 'url,title,excerpt');
         if (!empty($url)) {
@@ -892,11 +1109,13 @@ if (($mode === 'delete') && SEC_checkToken()) {
         COM_redirect($_CONF['site_admin_url'] . '/index.php');
     }
 } elseif ($mode === 'pingback') {
-    $type = Geeklog\Input::fRequest('type');
-    if (empty($type)) {
-        $type = 'article';
-    }
+    $type = Geeklog\Input::fRequest('type', 'article');
     $id = Geeklog\Input::fRequest('id');
+    
+    // Validate inputs
+    $type = GLText::stripTags($type);
+    $id = GLText::stripTags($id);
+    
     if (!empty($id)) {
         $display .= COM_startBlock($LANG_TRB['pingback_results'])
             . sendPingbacks($type, $id)
@@ -910,10 +1129,11 @@ if (($mode === 'delete') && SEC_checkToken()) {
     if (empty($id)) {
         COM_redirect($_CONF['site_admin_url'] . '/index.php');
     }
-    $type = Geeklog\Input::fRequest('type', '');
-    if (empty($type)) {
-        $type = 'article';
-    }
+    $type = Geeklog\Input::fRequest('type', 'article');
+    
+    // Validate inputs
+    $type = GLText::stripTags($type);
+    $id = GLText::stripTags($id);
 
     $pingback_sent = isset($_REQUEST['pingback_sent']);
     $ping_sent = isset($_REQUEST['ping_sent']);
@@ -929,9 +1149,9 @@ if (($mode === 'delete') && SEC_checkToken()) {
             $pingresult = sendPings($type, $id);
             $ping_sent = true;
         } elseif (isset($what[2])) {  // Trackback
-            $url = $_CONF['site_admin_url'] . '/trackback.php?mode=pretrackback&amp;id=' . $id;
+            $url = $_CONF['site_admin_url'] . '/trackback.php?mode=pretrackback&amp;id=' . urlencode($id);
             if ($type !== 'article') {
-                $url .= '&amp;type=' . $type;
+                $url .= '&amp;type=' . urlencode($type);
             }
             COM_redirect($url);
         }
@@ -941,7 +1161,7 @@ if (($mode === 'delete') && SEC_checkToken()) {
     
     // Check if item exist
     if (!empty($title)) {
-        $display .= COM_startBlock(sprintf($LANG_TRB['send_pings_for'], $title));
+        $display .= COM_startBlock(sprintf($LANG_TRB['send_pings_for'], secureHtmlEscape($title)));
 
         $template = COM_newTemplate(CTL_core_templatePath($_CONF['path_layout'] . 'admin/trackback'));
         $template->set_file(array('form' => 'pingform.thtml'));
@@ -955,8 +1175,8 @@ if (($mode === 'delete') && SEC_checkToken()) {
                 $template->set_var('lang_pingback_button', $LANG_TRB['pingback_button']);
                 $template->set_var('lang_pingback_short', $LANG_TRB['pingback_short']);
                 $button = '<button type="submit" name="what[0]" value="'
-                    . $LANG_TRB['pingback_button'] . '" class="uk-form">'
-                    . $LANG_TRB['pingback_button'] . '</button>';
+                    . secureHtmlEscape($LANG_TRB['pingback_button']) . '" class="uk-form">'
+                    . secureHtmlEscape($LANG_TRB['pingback_button']) . '</button>';
                 $template->set_var('pingback_button', $button);
             }
         } else {
@@ -967,8 +1187,8 @@ if (($mode === 'delete') && SEC_checkToken()) {
                 $template->set_var('lang_ping_button', $LANG_TRB['ping_button']);
                 $template->set_var('lang_ping_short', $LANG_TRB['ping_short']);
                 $button = '<button type="submit" name="what[1]" value="'
-                    . $LANG_TRB['ping_button'] . '" class="uk-form">'
-                    . $LANG_TRB['ping_button'] . '</button>';
+                    . secureHtmlEscape($LANG_TRB['ping_button']) . '" class="uk-form">'
+                    . secureHtmlEscape($LANG_TRB['ping_button']) . '</button>';
                 $template->set_var('ping_button', $button);
             }
         } else {
@@ -979,8 +1199,8 @@ if (($mode === 'delete') && SEC_checkToken()) {
                 $template->set_var('lang_trackback_button', $LANG_TRB['trackback_button']);
                 $template->set_var('lang_trackback_short', $LANG_TRB['trackback_short']);
                 $button = '<button type="submit" name="what[2]" value="'
-                    . $LANG_TRB['trackback_button'] . '" class="uk-form">'
-                    . $LANG_TRB['trackback_button'] . '</button>';
+                    . secureHtmlEscape($LANG_TRB['trackback_button']) . '" class="uk-form">'
+                    . secureHtmlEscape($LANG_TRB['trackback_button']) . '</button>';
                 $template->set_var('trackback_button', $button);
             }
         } else {
@@ -997,8 +1217,8 @@ if (($mode === 'delete') && SEC_checkToken()) {
         if ($trackback_sent) {
             $hidden .= '<input type="hidden" name="trackback_sent" value="1"' . XHTML . '>';
         }
-        $hidden .= '<input type="hidden" name="id" value="' . $id . '"' . XHTML . '>';
-        $hidden .= '<input type="hidden" name="type" value="' . $type . '"' . XHTML . '>';
+        $hidden .= '<input type="hidden" name="id" value="' . secureHtmlEscape($id) . '"' . XHTML . '>';
+        $hidden .= '<input type="hidden" name="type" value="' . secureHtmlEscape($type) . '"' . XHTML . '>';
         $hidden .= '<input type="hidden" name="mode" value="sendall"' . XHTML . '>';
         $template->set_var('hidden_input_fields', $hidden);
 
@@ -1016,10 +1236,11 @@ if (($mode === 'delete') && SEC_checkToken()) {
     if (empty($id)) {
         COM_redirect($_CONF['site_admin_url'] . '/index.php');
     }
-    $type = Geeklog\Input::fRequest('type');
-    if (empty($type)) {
-        $type = 'article';
-    }
+    $type = Geeklog\Input::fRequest('type', 'article');
+
+    // Validate inputs
+    $type = GLText::stripTags($type);
+    $id = GLText::stripTags($id);
 
     $fulltext = PLG_getItemInfo($type, $id, 'description');
 
@@ -1041,12 +1262,18 @@ if (($mode === 'delete') && SEC_checkToken()) {
         COM_redirect($_CONF['site_admin_url'] . '/index.php');
     }
 
-    $type = Geeklog\Input::fRequest('type');
-    if (empty($type)) {
-        $type = 'article';
+    $type = Geeklog\Input::fRequest('type', 'article');
+
+    // Validate inputs
+    $type = GLText::stripTags($type);
+    $id = GLText::stripTags($id);
+    $validated_url = validateUrl($url);
+    
+    if ($validated_url === false) {
+        COM_redirect($_CONF['site_admin_url'] . '/index.php');
     }
 
-    $trackbackUrl = TRB_detectTrackbackUrl($url);
+    $trackbackUrl = TRB_detectTrackbackUrl($validated_url);
 
     list($url, $title, $excerpt) = PLG_getItemInfo($type, $id, 'url,title,excerpt');
     
@@ -1076,6 +1303,11 @@ if (($mode === 'delete') && SEC_checkToken()) {
     if (isset($_REQUEST['id'], $_REQUEST['type'])) {
         $id = Geeklog\Input::fRequest('id', '');
         $type = Geeklog\Input::fRequest('type', '');
+        
+        // Validate inputs
+        $type = GLText::stripTags($type);
+        $id = GLText::stripTags($id);
+        
         if (!empty($id) && !empty($type)) {
             list($newurl, $newtitle, $newexcerpt) = PLG_getItemInfo($type, $id, 'url,title,excerpt');
             $newexcerpt = trim(GLText::stripTags($newexcerpt));
@@ -1086,7 +1318,7 @@ if (($mode === 'delete') && SEC_checkToken()) {
             if (empty($title) && !empty($newtitle)) {
                 $title = $newtitle;
             }
-            if (empty($newexcerpt) && !empty($newexcerpt)) {
+            if (empty($excerpt) && !empty($newexcerpt)) {
                 $excerpt = $newexcerpt;
             }
 
@@ -1104,9 +1336,14 @@ if (($mode === 'delete') && SEC_checkToken()) {
 
     $display = COM_createHTMLDocument($display, array('pagetitle' => $LANG_TRB['trackback']));
 } elseif (($mode === 'deleteservice') && SEC_checkToken()) {
-    $pid = (int) Geeklog\Input::fPost('service_id', 0);
-    if ($pid > 0) {
-        DB_delete($_TABLES['pingservice'], 'pid', $pid);
+    if (!validatePermission('delete_service')) {
+        COM_redirect($_CONF['site_admin_url'] . '/index.php');
+    }
+    
+    $pid = Geeklog\Input::fPost('service_id', 0);
+    $validPid = validateInteger($pid, 1);
+    if ($validPid !== false) {
+        DB_delete($_TABLES['pingservice'], 'pid', $validPid);
         COM_redirect($_CONF['site_admin_url'] . '/trackback.php?mode=listservice&amp;msg=66');
     } else {
         COM_redirect($_CONF['site_admin_url'] . '/index.php');
@@ -1114,16 +1351,19 @@ if (($mode === 'delete') && SEC_checkToken()) {
 } elseif (($mode === 'saveservice') && SEC_checkToken()) {
     $is_enabled = Geeklog\Input::post('is_enabled', '');
     $display .= saveService(
-        (int) Geeklog\Input::fPost('service_id'),
-        Geeklog\Input::fPost('service_name'),
-        Geeklog\Input::fPost('service_site_url'),
-        Geeklog\Input::fPost('service_ping_url'),
-        Geeklog\Input::post('method'),
+        Geeklog\Input::fPost('service_id', 0),
+        Geeklog\Input::post('service_name', ''),
+        Geeklog\Input::post('service_site_url', ''),
+        Geeklog\Input::post('service_ping_url', ''),
+        Geeklog\Input::post('method', ''),
         $is_enabled
     );
 } elseif ($mode === 'editservice') {
-    $service_id = (int) Geeklog\Input::fGet('service_id', 0);
-    $pid = COM_applyFilter($service_id, true);
+    $service_id = Geeklog\Input::fGet('service_id', 0);
+    $pid = validateInteger($service_id, 0);
+    if ($pid === false) {
+        $pid = 0;
+    }
 
     $display .= editServiceForm($pid);
 } elseif ($mode === 'listservice') {
@@ -1135,18 +1375,24 @@ if (($mode === 'delete') && SEC_checkToken()) {
     $display .= pingbackForm();
     $display = COM_createHTMLDocument($display, array('pagetitle' => $LANG_TRB['pingback']));
 } elseif ($mode === 'sendpingback') {
+    if (!SEC_checkToken()) {
+        COM_redirect($_CONF['site_admin_url'] . '/index.php');
+    }
+    
     $target = Geeklog\Input::fPost('target');
-    if (empty($target)) {
+    $validated_target = validateUrl($target);
+    
+    if ($validated_target === false) {
         $display .= showTrackbackMessage($LANG_TRB['pbtarget_missing'], $LANG_TRB['pbtarget_required']);
-    } elseif (SEC_checkToken()) {
-        $result = PNB_sendPingback($_CONF['site_url'], $target);
+    } else {
+        $result = PNB_sendPingback($_CONF['site_url'], $validated_target);
         if (empty($result)) {
             $display .= COM_showMessage(74);
             $target = '';
         } else {
             $message = '<p>' . $LANG_TRB['pb_error_details'] . '<br' . XHTML . '>'
                 . '<span class="warningsmall">'
-                . htmlspecialchars($result) . '</span></p>';
+                . secureHtmlEscape($result) . '</span></p>';
             $display .= showTrackbackMessage($LANG_TRB['send_error'], $message);
         }
     }
